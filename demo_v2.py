@@ -156,7 +156,8 @@ class AgXToneMapping(nn.Module):
     def __init__(self):
         super().__init__()
         # Scene exposure adjustment (in stops)
-        self.exposure = nn.Parameter(torch.tensor(0.0))
+        # Start at +1.5 stops to compensate for linear RAW being dark
+        self.exposure = nn.Parameter(torch.tensor(1.5))
         # Contrast (slope at mid-gray)
         self.contrast = nn.Parameter(torch.tensor(0.0))
         # Gamma for final display transform
@@ -165,24 +166,23 @@ class AgXToneMapping(nn.Module):
     def forward(self, x):
         # Apply exposure (in stops, so 2^exposure)
         exposure_factor = torch.pow(torch.tensor(2.0, device=x.device), 
-                                    torch.clamp(self.exposure, -3, 3))
+                                    torch.clamp(self.exposure, -3, 4))
         x = x * exposure_factor
         
-        # Contrast adjustment (around 0.18 mid-gray)
-        contrast = 1.0 + torch.tanh(self.contrast) * 0.5  # [0.5, 1.5]
-        x = torch.pow(x + 1e-6, contrast)
+        # Simple gamma first to get into perceptual space
+        # Linear RAW needs ~2.2 gamma to look normal
+        base_gamma = 1.0 / 2.2
+        x = torch.pow(x.clamp(min=1e-6), base_gamma)
         
-        # Filmic S-curve (attempt to emulate AgX look)
-        # This curve compresses highlights smoothly while lifting shadows slightly
-        # Using attempt at smooth rolloff
-        white_point = 1.0
-        x_curved = (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14)
+        # Contrast adjustment (around mid-gray)
+        contrast = 1.0 + torch.tanh(self.contrast) * 0.3  # [0.7, 1.3]
+        x = 0.5 + (x - 0.5) * contrast
         
-        # Gamma adjustment for display
-        gamma = 1.0 / (1.0 + torch.tanh(self.gamma) * 0.3)  # ~[0.77, 1.3] -> inverted for pow
-        x_gamma = torch.pow(torch.clamp(x_curved, 1e-6, 1.0), gamma)
+        # Gamma fine-tuning
+        gamma_adjust = 1.0 + torch.tanh(self.gamma) * 0.2  # [0.8, 1.2]
+        x = torch.pow(x.clamp(min=1e-6, max=1.0), gamma_adjust)
         
-        return torch.clamp(x_gamma, 0, 1)
+        return torch.clamp(x, 0, 1)
 
 
 #############################
@@ -973,7 +973,7 @@ class ProcessorOptimizerV2:
                       f"aesthetic_score={aes_score:.2f}, {loss_str}")
             
             # Live view update
-            if live_view and (step % 5 == 0 or step == num_steps - 1):
+            if live_view:
                 with torch.no_grad():
                     # Get current processed image
                     display_img = processed.squeeze(0).permute(1, 2, 0).cpu().numpy()
